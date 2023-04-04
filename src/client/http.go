@@ -3,7 +3,6 @@ package client
 import (
 	"bytes"
 	"crypto/tls"
-	"log"
 	"net/http"
 )
 
@@ -19,17 +18,21 @@ func InitHttp() *Http {
 	return &Http{httpClient}
 }
 
-func (h *Http) Do(url string, data []byte, headers map[string]string) (*http.Response, error) {
+func (h *Http) Do(url string, data []byte, requiredHeaders map[string]string, additionalHeaders map[string]string) (*http.Response, error) {
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
 	if err != nil {
 		return nil, err
 	}
-	if len(headers) > 0 {
-		for key, value := range headers {
+	if len(requiredHeaders) > 0 {
+		for key, value := range requiredHeaders {
 			req.Header.Add(key, value)
 		}
 	}
-	log.Println(req.URL)
+	if len(additionalHeaders) > 0 {
+		for key, value := range additionalHeaders {
+			req.Header.Add(key, value)
+		}
+	}
 	return h.Client.Do(req)
 }
 
