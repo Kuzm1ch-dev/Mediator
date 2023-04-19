@@ -7,7 +7,7 @@ import (
 	"io/ioutil"
 	"log"
 	"mediator/src/client"
-	"mediator/src/storage"
+	"mediator/src/config"
 	"net/http"
 	"os"
 	"strings"
@@ -16,19 +16,18 @@ import (
 	"github.com/google/uuid"
 )
 
-var Transactions map[string]chan (string) = make(map[string]chan (string))
+var Transactions map[string]chan ([]byte) = make(map[string]chan ([]byte))
 
 type Manager struct {
-	Config client.Config
+	Config config.Config
 	Gin    *gin.Engine
 	Http   *client.Http `json:"Http, omitempty"`
-	Base   storage.Base
 }
 
 func InitManager() *Manager {
 	pwd, _ := os.Getwd()
 	configFile, _ := ioutil.ReadFile(pwd + "/config.json")
-	var config client.Config
+	var config config.Config
 	err := json.Unmarshal(configFile, &config)
 	if err != nil {
 		//file, _ := os.OpenFile(pwd+"/config.json", os.O_RDWR|os.O_CREATE, 0777)
@@ -38,7 +37,7 @@ func InitManager() *Manager {
 	}
 	router := gin.Default()
 
-	manager := &Manager{config, router, client.InitHttp(), *storage.InitBase()}
+	manager := &Manager{config, router, client.InitHttp()}
 
 	for _, client := range manager.Config.ClientList {
 		log.Println("Служебный топик для клиента:")
@@ -54,15 +53,9 @@ func InitManager() *Manager {
 			if topic.Name == "Query" {
 				return nil
 			}
-			manager.Base.AddTopic(topic.Name)
 			for _, method := range topic.Methods {
 				manager.Gin.POST(fmt.Sprintf("%s/%s/%s", client.UUID, topic.Name, method.Name), manager.HandleContext)
 			}
-		}
-	}
-	for _, client := range manager.Config.ClientList {
-		for _, subscription := range client.Subscriptions {
-			manager.Base.AddSubscription(subscription.Name, client.Name)
 		}
 	}
 
@@ -70,17 +63,12 @@ func InitManager() *Manager {
 }
 
 func (m *Manager) HandleContext(ctx *gin.Context) {
-
-	var channel chan (string) // Канал для возврата данных
-	var waitResponse bool = false
-	if ctx.Request.Header.Get("Response-Header") != "" { // Если от этого запроса ожидают ответа, берем канал из буфера
-		channel = Transactions[ctx.Request.Header.Get("Response-Header")]
-		waitResponse = true
-	}
-
 	a := strings.Split(ctx.Request.URL.String(), "/")
 	name, topic, method := a[1], a[2], a[3]
 	source_client, err := m.Config.GetClient(name)
+
+	data, _ := ioutil.ReadAll(ctx.Request.Body)
+
 	if err != nil {
 		log.Println("Нет такого источника")
 		return
@@ -96,15 +84,23 @@ func (m *Manager) HandleContext(ctx *gin.Context) {
 		return
 	}
 
+	var channel chan ([]byte) // Канал для возврата данных
+	var waitResponse bool = false
+	if ctx.Request.Header.Get("Response-Header") != "" { // Если от этого запроса ожидают ответа, берем канал из буфера
+		channel = Transactions[ctx.Request.Header.Get("Response-Header")]
+		waitResponse = true
+	}
 	var additionalHeaders map[string]string
 	additionalHeaders = make(map[string]string)
+
 	if source_method.Response { // Если запрос с ожиданием ответа создаем канал и кладем в буфер
 		uuidTempRoute := uuid.NewString()
 		additionalHeaders["Response-Header"] = uuidTempRoute
-		Transactions[uuidTempRoute] = make(chan (string))
+		Transactions[uuidTempRoute] = make(chan ([]byte))
 		go func() {
 			log.Println(source_client.Name, "Пауза. Ожидаю ответ!")
 			response := <-Transactions[uuidTempRoute]
+			log.Println(string(response))
 			log.Println("Возобновление. Получил ответ!")
 			ctx.Data(200, "json", []byte(response))
 		}()
@@ -115,37 +111,31 @@ func (m *Manager) HandleContext(ctx *gin.Context) {
 			continue
 		}
 		om, withoutTopic := destination_client.HasSubscription(topic, method)
+		log.Println(fmt.Sprintf("from %s to %s, topic: %s method: %s", name, destination_client.Name, topic, om))
+		var resp *http.Response
 		if om != "" { // Проверка на стороннее название метода REST у точки назначения
-			data, _ := ioutil.ReadAll(ctx.Request.Body)
-			log.Println(fmt.Sprintf("from %s to %s, topic: %s method: %s", name, destination_client.Name, topic, om))
-
 			if withoutTopic {
-				resp, err := m.Http.Do(fmt.Sprintf("%s/%s", destination_client.URL, om), data, destination_client.GetHeaders(topic, method), additionalHeaders)
-				if err != nil {
-					log.Println(err)
-					m.Base.AddOffset(topic, destination_client.Name)
-					return
-				}
-				if waitResponse {
-					data, _ := ioutil.ReadAll(resp.Body)
-					channel <- string(data)
-				}
+				resp, err = m.Http.Do(fmt.Sprintf("%s/%s", destination_client.URL, om), data, destination_client.GetHeaders(topic, method), additionalHeaders)
 			} else {
-				resp, err := m.Http.Do(fmt.Sprintf("%s/%s/%s", destination_client.URL, topic, om), data, destination_client.GetHeaders(topic, method), additionalHeaders)
-				if err != nil {
-					m.Base.AddOffset(topic, destination_client.Name)
-					log.Println(err)
-					return
-				}
-				if waitResponse {
-					data, _ := ioutil.ReadAll(resp.Body)
-					channel <- string(data)
-				}
+				resp, err = m.Http.Do(fmt.Sprintf("%s/%s/%s", destination_client.URL, topic, om), data, destination_client.GetHeaders(topic, method), additionalHeaders)
 			}
+			if err != nil {
+				log.Println(err)
+				return
+			}
+			if waitResponse {
+				data_response, _ := ioutil.ReadAll(resp.Body)
+				channel <- data_response
+				return
+			}
+			data, _ := ioutil.ReadAll(resp.Body)
+			log.Println(source_client.Name, string(data))
+			ctx.Data(200, "json", data)
 		}
 	}
-	data, _ := ioutil.ReadAll(ctx.Request.Body)
-	m.Base.AddMessage(string(data), topic)
+}
+func (m *Manager) Send(source_client *client.Client, message []byte, topic string, method string) {
+
 }
 
 func (m *Manager) HandleQuery(context *gin.Context) {
